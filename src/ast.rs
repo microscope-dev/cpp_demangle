@@ -908,61 +908,6 @@ where
     ) -> fmt::Result;
 }
 
-macro_rules! reference_newtype {
-    ( $newtype_name:ident , $oldtype:ty ) => {
-        #[derive(Debug)]
-        struct $newtype_name($oldtype);
-
-        impl $newtype_name {
-            #[allow(clippy::ptr_arg)]
-            #[allow(unsafe_code)]
-            fn new(types: &$oldtype) -> &$newtype_name {
-                unsafe {
-                    // This is safe because we only create an immutable
-                    // reference. We are not breaking unique mutable aliasing
-                    // requirements. An immutable reference does not allow
-                    // dropping the referent, so no worries about double-free
-                    // (additionally, see the assertion inside `Drop` below).
-                    &*(types as *const $oldtype as *const $newtype_name)
-                }
-            }
-        }
-
-        impl Drop for $newtype_name {
-            fn drop(&mut self) {
-                unreachable!(
-                    "Dropping implies we dereferenced and took ownership, which \
-                              is not safe for this newtype"
-                );
-            }
-        }
-
-        impl ops::Deref for $newtype_name {
-            type Target = $oldtype;
-
-            fn deref(&self) -> &Self::Target {
-                &self.0
-            }
-        }
-    };
-}
-
-// We can't implement `DemangleAsInner` for newtypes of `[TypeHandle]` like we
-// want to because it is unsized and we need to make trait objects out of
-// `DemangleAsInner` for pushing onto the context's inner stack. Therefore, we
-// have this inelegant newtyping of `Vec<TypeHandle>`.
-
-// A set of function arguments.
-reference_newtype!(FunctionArgList, Vec<TypeHandle>);
-
-// A set of function arguments prefixed by a return type (which we want to
-// ignore).
-reference_newtype!(FunctionArgListAndReturnType, Vec<TypeHandle>);
-
-// A newtype around a slice of type handles that we format as function
-// arguments.
-reference_newtype!(FunctionArgSlice, [TypeHandle]);
-
 /// Whether the parameter type `ty` expands a template argument pack that
 /// `scope` binds to no arguments, so that it stands for no parameter at all
 /// (microscope's patch).
@@ -994,138 +939,101 @@ fn expands_empty_pack<'subs, 'prev>(
     false
 }
 
-// Demangle a slice of TypeHandle as a function argument list.
-impl<'subs, W> Demangle<'subs, W> for FunctionArgSlice
+/// Format function arguments directly from their borrowed type handles.
+fn demangle_function_args<'subs, 'prev, 'ctx, W>(
+    args: &'subs [TypeHandle],
+    ctx: &'ctx mut DemangleContext<'subs, W>,
+    scope: Option<ArgScopeStack<'prev, 'subs>>,
+) -> fmt::Result
 where
     W: 'subs + DemangleWrite,
 {
-    fn demangle<'prev, 'ctx>(
-        &'subs self,
-        ctx: &'ctx mut DemangleContext<'subs, W>,
-        scope: Option<ArgScopeStack<'prev, 'subs>>,
-    ) -> fmt::Result {
-        let ctx = try_begin_demangle!(self, ctx, scope);
+    let ctx = try_begin_demangle!(args, ctx, scope);
 
-        let mut saw_needs_paren = false;
-        let (needs_space, needs_paren) = ctx
-            .inner
-            .iter()
-            .rev()
-            .map(|inner| {
-                if inner.downcast_to_pointer_to_member().is_some() {
-                    (true, true)
-                } else {
-                    match inner.downcast_to_type() {
-                        Some(&Type::Qualified(..))
-                        | Some(&Type::Complex(_))
-                        | Some(&Type::Imaginary(_))
-                        | Some(&Type::PointerToMember(_)) => (true, true),
-                        Some(&Type::PointerTo(_))
-                        | Some(&Type::LvalueRef(_))
-                        | Some(&Type::RvalueRef(_)) => (false, true),
-                        _ => (false, false),
-                    }
+    let mut saw_needs_paren = false;
+    let (needs_space, needs_paren) = ctx
+        .inner
+        .iter()
+        .rev()
+        .map(|inner| {
+            if inner.downcast_to_pointer_to_member().is_some() {
+                (true, true)
+            } else {
+                match inner.downcast_to_type() {
+                    Some(&Type::Qualified(..))
+                    | Some(&Type::Complex(_))
+                    | Some(&Type::Imaginary(_))
+                    | Some(&Type::PointerToMember(_)) => (true, true),
+                    Some(&Type::PointerTo(_))
+                    | Some(&Type::LvalueRef(_))
+                    | Some(&Type::RvalueRef(_)) => (false, true),
+                    _ => (false, false),
                 }
-            })
-            .take_while(|&(_, needs_paren)| {
-                if saw_needs_paren {
-                    false
-                } else {
-                    saw_needs_paren |= needs_paren;
-                    true
-                }
-            })
-            .fold(
-                (false, false),
-                |(space, paren), (next_space, next_paren)| {
-                    (space || next_space, paren || next_paren)
-                },
-            );
-
-        if needs_paren {
-            let needs_space = needs_space
-                || match ctx.last_char_written {
-                    Some('(') | Some('*') => false,
-                    _ => true,
-                };
-
-            if needs_space {
-                ctx.ensure_space()?;
             }
+        })
+        .take_while(|&(_, needs_paren)| {
+            if saw_needs_paren {
+                false
+            } else {
+                saw_needs_paren |= needs_paren;
+                true
+            }
+        })
+        .fold(
+            (false, false),
+            |(space, paren), (next_space, next_paren)| (space || next_space, paren || next_paren),
+        );
 
-            write!(ctx, "(")?;
-        }
+    if needs_paren {
+        let needs_space = needs_space
+            || match ctx.last_char_written {
+                Some('(') | Some('*') => false,
+                _ => true,
+            };
 
-        ctx.demangle_inner_prefixes(scope)?;
-
-        if needs_paren {
-            write!(ctx, ")")?;
+        if needs_space {
+            ctx.ensure_space()?;
         }
 
         write!(ctx, "(")?;
+    }
 
-        // To maintain compatibility with libiberty, print `()` instead of
-        // `(void)` for functions that take no arguments.
-        if self.len() == 1 && self[0].is_void() {
-            write!(ctx, ")")?;
-            return Ok(());
-        }
+    ctx.demangle_inner_prefixes(scope)?;
 
-        // Only the first param should have `this`.
-        if ctx.is_explicit_obj_param {
-            write!(ctx, "this ")?;
-            ctx.is_explicit_obj_param = false;
-        }
-
-        let mut need_comma = false;
-        for arg in self.iter() {
-            if expands_empty_pack(arg, ctx.subs, scope) {
-                continue;
-            }
-            if need_comma {
-                write!(ctx, ", ")?;
-            }
-            arg.demangle(ctx, scope)?;
-            need_comma = true;
-        }
-
+    if needs_paren {
         write!(ctx, ")")?;
-
-        ctx.demangle_inners(scope)
     }
-}
 
-impl<'subs, W> Demangle<'subs, W> for FunctionArgList
-where
-    W: 'subs + DemangleWrite,
-{
-    fn demangle<'prev, 'ctx>(
-        &'subs self,
-        ctx: &'ctx mut DemangleContext<'subs, W>,
-        scope: Option<ArgScopeStack<'prev, 'subs>>,
-    ) -> fmt::Result {
-        FunctionArgSlice::new(&self.0[..]).demangle(ctx, scope)
+    write!(ctx, "(")?;
+
+    // To maintain compatibility with libiberty, print `()` instead of
+    // `(void)` for functions that take no arguments.
+    if args.len() == 1 && args[0].is_void() {
+        write!(ctx, ")")?;
+        return Ok(());
     }
-}
 
-impl<'subs, W> DemangleAsInner<'subs, W> for FunctionArgList where W: 'subs + DemangleWrite {}
-
-impl<'subs, W> Demangle<'subs, W> for FunctionArgListAndReturnType
-where
-    W: 'subs + DemangleWrite,
-{
-    fn demangle<'prev, 'ctx>(
-        &'subs self,
-        ctx: &'ctx mut DemangleContext<'subs, W>,
-        scope: Option<ArgScopeStack<'prev, 'subs>>,
-    ) -> fmt::Result {
-        FunctionArgSlice::new(&self.0[1..]).demangle(ctx, scope)
+    // Only the first param should have `this`.
+    if ctx.is_explicit_obj_param {
+        write!(ctx, "this ")?;
+        ctx.is_explicit_obj_param = false;
     }
-}
 
-impl<'subs, W> DemangleAsInner<'subs, W> for FunctionArgListAndReturnType where
-    W: 'subs + DemangleWrite
-{
+    let mut need_comma = false;
+    for arg in args {
+        if expands_empty_pack(arg, ctx.subs, scope) {
+            continue;
+        }
+        if need_comma {
+            write!(ctx, ", ")?;
+        }
+        arg.demangle(ctx, scope)?;
+        need_comma = true;
+    }
+
+    write!(ctx, ")")?;
+
+    ctx.demangle_inners(scope)
 }
 
 /// Define a handle to a AST type that lives inside the substitution table. A
@@ -1591,16 +1499,12 @@ where
         scope: Option<ArgScopeStack<'prev, 'subs>>,
     ) -> fmt::Result {
         if let Encoding::Function(ref name, ref fun_ty) = *self {
-            let (scope, function_args) =
-                if let Some(template_args) = name.get_template_args(ctx.subs) {
-                    let scope = scope.push(template_args);
-                    let function_args = FunctionArgListAndReturnType::new(&fun_ty.0);
-                    (scope, function_args as &dyn DemangleAsInner<W>)
-                } else {
-                    let function_args = FunctionArgList::new(&fun_ty.0);
-                    (scope, function_args as &dyn DemangleAsInner<W>)
-                };
-            function_args.demangle_as_inner(ctx, scope)
+            // A template function's types start with its return type.
+            if let Some(template_args) = name.get_template_args(ctx.subs) {
+                demangle_function_args(&fun_ty.0[1..], ctx, scope.push(template_args))
+            } else {
+                demangle_function_args(&fun_ty.0, ctx, scope)
+            }
         } else {
             unreachable!("we only push Encoding::Function onto the inner stack");
         }
@@ -4698,8 +4602,8 @@ impl BareFunctionType {
         &self.0[0]
     }
 
-    fn args(&self) -> &FunctionArgListAndReturnType {
-        FunctionArgListAndReturnType::new(&self.0)
+    fn args(&self) -> &[TypeHandle] {
+        &self.0[1..]
     }
 }
 
@@ -4750,8 +4654,7 @@ where
         scope: Option<ArgScopeStack<'prev, 'subs>>,
     ) -> fmt::Result {
         let ctx = try_begin_demangle_as_inner!(self, ctx, scope);
-        self.args().demangle_as_inner(ctx, scope)?;
-        Ok(())
+        demangle_function_args(self.args(), ctx, scope)
     }
 }
 
@@ -8475,7 +8378,6 @@ where
 
 /// Parse a number with the given `base`. Do not allow negative numbers
 /// (prefixed with an 'n' instead of a '-') if `allow_signed` is false.
-#[allow(unsafe_code)]
 fn parse_number(base: u32, allow_signed: bool, mut input: IndexStr) -> Result<(isize, IndexStr)> {
     if input.is_empty() {
         return Err(error::Error::UnexpectedEnd);
@@ -8512,11 +8414,8 @@ fn parse_number(base: u32, allow_signed: bool, mut input: IndexStr) -> Result<(i
         return Err(error::Error::UnexpectedText);
     }
 
-    let head = unsafe {
-        // Safe because we know we only have valid numeric chars in this
-        // slice, which are valid UTF-8.
-        str::from_utf8_unchecked(head)
-    };
+    // Validate the digit slice without relying on unchecked UTF-8 conversion.
+    let head = str::from_utf8(head).map_err(|_| error::Error::UnexpectedText)?;
 
     let mut number = isize::from_str_radix(head, base).map_err(|_| error::Error::Overflow)?;
     if num_is_negative {

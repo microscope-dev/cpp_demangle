@@ -28,7 +28,7 @@
 
 #![deny(missing_docs)]
 #![deny(missing_debug_implementations)]
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 // Clippy stuff.
 #![allow(unknown_lints)]
 #![allow(clippy::inline_always)]
