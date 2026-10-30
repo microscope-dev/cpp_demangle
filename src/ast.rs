@@ -963,6 +963,37 @@ reference_newtype!(FunctionArgListAndReturnType, Vec<TypeHandle>);
 // arguments.
 reference_newtype!(FunctionArgSlice, [TypeHandle]);
 
+/// Whether the parameter type `ty` expands a template argument pack that
+/// `scope` binds to no arguments, so that it stands for no parameter at all
+/// (microscope's patch).
+fn expands_empty_pack<'subs, 'prev>(
+    ty: &TypeHandle,
+    subs: &'subs SubstitutionTable,
+    scope: Option<ArgScopeStack<'prev, 'subs>>,
+) -> bool {
+    let mut handle = match subs.get_type(ty) {
+        Some(&Type::PackExpansion(ref inner)) => inner,
+        _ => return false,
+    };
+    // A pattern is the parameter under a few qualifiers and references.
+    for _ in 0..8 {
+        match subs.get_type(handle) {
+            Some(&Type::Qualified(_, ref inner))
+            | Some(&Type::PointerTo(ref inner))
+            | Some(&Type::LvalueRef(ref inner))
+            | Some(&Type::RvalueRef(ref inner)) => handle = inner,
+            Some(&Type::TemplateParam(ref param)) => {
+                return matches!(
+                    param.resolve(scope),
+                    Ok(&TemplateArg::ArgPack(ref args)) if args.is_empty()
+                );
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
 // Demangle a slice of TypeHandle as a function argument list.
 impl<'subs, W> Demangle<'subs, W> for FunctionArgSlice
 where
@@ -1048,6 +1079,9 @@ where
 
         let mut need_comma = false;
         for arg in self.iter() {
+            if expands_empty_pack(arg, ctx.subs, scope) {
+                continue;
+            }
             if need_comma {
                 write!(ctx, ", ")?;
             }
@@ -1460,6 +1494,7 @@ impl Parse for Encoding {
 
         if let Ok((name, tail)) = try_recurse!(Name::parse(ctx, subs, input)) {
             if let Ok((ty, tail)) = try_recurse!(BareFunctionType::parse(ctx, subs, tail)) {
+                let tail = skip_requires_clause(ctx, subs, tail)?;
                 return Ok((Encoding::Function(name, ty), tail));
             } else {
                 return Ok((Encoding::Data(name), tail));
@@ -5283,9 +5318,15 @@ where
 /// ```text
 /// <template-param> ::= T_ # first template parameter
 ///                  ::= T <parameter-2 non-negative number> _
+///                  ::= TL <level-1 non-negative number> __
+///                  ::= TL <level-1 non-negative number> _ <parameter-2 non-negative number> _
 /// ```
+///
+/// The second field is the level of a `TL` parameter, one that a template
+/// parameter declaration of an enclosing level introduced (microscope's
+/// patch).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TemplateParam(usize);
+pub struct TemplateParam(usize, Option<usize>);
 
 impl Parse for TemplateParam {
     fn parse<'a, 'b>(
@@ -5296,12 +5337,19 @@ impl Parse for TemplateParam {
         try_begin_parse!("TemplateParam", ctx, input);
 
         let input = consume(b"T", input)?;
+        let (level, input) = match consume(b"L", input) {
+            Ok(input) => {
+                let (level, input) = parse_number(10, false, input)?;
+                (Some(level as usize + 1), consume(b"_", input)?)
+            }
+            Err(_) => (None, input),
+        };
         let (number, input) = match parse_number(10, false, input) {
             Ok((number, input)) => ((number + 1) as _, input),
             Err(_) => (0, input),
         };
         let input = consume(b"_", input)?;
-        Ok((TemplateParam(number), input))
+        Ok((TemplateParam(number, level), input))
     }
 }
 
@@ -5317,7 +5365,14 @@ where
         let ctx = try_begin_demangle!(self, ctx, scope);
 
         ctx.push_demangle_node(DemangleNodeType::TemplateParam);
-        let ret = if ctx.is_lambda_arg {
+        let ret = if self.1.is_some() {
+            // A parameter of an enclosing level's declarations, which only
+            // a constraint names; as llvm-cxxfilt spells it.
+            match self.0 {
+                0 => write!(ctx, "$T"),
+                index => write!(ctx, "$T{}", index - 1),
+            }
+        } else if ctx.is_lambda_arg {
             // To match libiberty, template references are converted to `auto`.
             write!(ctx, "auto:{}", self.0 + 1)
         } else {
@@ -5503,6 +5558,7 @@ impl Parse for TemplateArgs {
         let tail = consume(b"I", input)?;
 
         let (args, tail) = one_or_more::<TemplateArg>(ctx, subs, tail)?;
+        let tail = skip_requires_clause(ctx, subs, tail)?;
         let tail = consume(b"E", tail)?;
         Ok((TemplateArgs(args), tail))
     }
@@ -5527,6 +5583,11 @@ where
         ctx.push_demangle_node(DemangleNodeType::TemplateArgs);
         let mut need_comma = false;
         for arg_index in 0..self.0.len() {
+            // An empty pack adds no argument, nor a comma before it
+            // (microscope's patch).
+            if matches!(self.0[arg_index], TemplateArg::ArgPack(ref args) if args.is_empty()) {
+                continue;
+            }
             if need_comma {
                 write!(ctx, ", ")?;
             }
@@ -5591,6 +5652,69 @@ pub enum TemplateArg {
     ArgPack(Vec<TemplateArg>),
 }
 
+/// Whether `input` begins with C++20's `<template-param-decl>`.
+fn is_template_param_decl(input: &IndexStr) -> bool {
+    input.peek() == Some(b'T')
+        && matches!(
+            input.peek_second(),
+            Some(b'y') | Some(b'k') | Some(b'n') | Some(b't') | Some(b'p')
+        )
+}
+
+/// Skips C++20's `<template-param-decl>`, which declares the parameter a
+/// template argument binds, and returns what follows. A constraint's name
+/// is parsed as any name is, so that it is a substitution candidate.
+///
+/// ```text
+/// <template-param-decl> ::= Ty                                  # type parameter
+///                       ::= Tk <type-constraint> [<template-args>] # constrained type parameter
+///                       ::= Tn <type>                           # non-type parameter
+///                       ::= Tt <template-param-decl>* [Q <expression>] E # template template parameter
+///                       ::= Tp <template-param-decl>            # parameter pack
+/// ```
+///
+/// microscope's patch: libiberty and llvm-cxxfilt print the argument only.
+fn skip_template_param_decl<'a, 'b>(
+    ctx: &'a ParseContext,
+    subs: &'a mut SubstitutionTable,
+    input: IndexStr<'b>,
+) -> Result<IndexStr<'b>> {
+    let _guard = AutoParseRecursion::new(ctx)?;
+    if let Ok(tail) = consume(b"Ty", input) {
+        return Ok(tail);
+    }
+    if let Ok(tail) = consume(b"Tk", input) {
+        let (_, tail) = Name::parse(ctx, subs, tail)?;
+        return Ok(tail);
+    }
+    if let Ok(tail) = consume(b"Tn", input) {
+        let (_, tail) = TypeHandle::parse(ctx, subs, tail)?;
+        return Ok(tail);
+    }
+    if let Ok(mut tail) = consume(b"Tt", input) {
+        while is_template_param_decl(&tail) {
+            tail = skip_template_param_decl(ctx, subs, tail)?;
+        }
+        tail = skip_requires_clause(ctx, subs, tail)?;
+        return consume(b"E", tail);
+    }
+    let tail = consume(b"Tp", input)?;
+    skip_template_param_decl(ctx, subs, tail)
+}
+
+/// Skips a C++20 requires clause, `Q <expression>`, if `input` begins with
+/// one (microscope's patch).
+fn skip_requires_clause<'a, 'b>(
+    ctx: &'a ParseContext,
+    subs: &'a mut SubstitutionTable,
+    input: IndexStr<'b>,
+) -> Result<IndexStr<'b>> {
+    match consume(b"Q", input) {
+        Ok(tail) => Expression::parse(ctx, subs, tail).map(|(_, tail)| tail),
+        Err(_) => Ok(input),
+    }
+}
+
 impl Parse for TemplateArg {
     fn parse<'a, 'b>(
         ctx: &'a ParseContext,
@@ -5598,6 +5722,11 @@ impl Parse for TemplateArg {
         input: IndexStr<'b>,
     ) -> Result<(TemplateArg, IndexStr<'b>)> {
         try_begin_parse!("TemplateArg", ctx, input);
+
+        if is_template_param_decl(&input) {
+            let tail = skip_template_param_decl(ctx, subs, input)?;
+            return TemplateArg::parse(ctx, subs, tail);
+        }
 
         if let Ok(tail) = consume(b"X", input) {
             let (expr, tail) = Expression::parse(ctx, subs, tail)?;
@@ -7395,7 +7524,7 @@ impl Parse for Discriminator {
 /// The `<closure-type-name>` production.
 ///
 /// ```text
-/// <closure-type-name> ::= Ul <lambda-sig> E [ <nonnegative number> ] _
+/// <closure-type-name> ::= Ul <template-param-decl>* <lambda-sig> E [ <nonnegative number> ] _
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClosureTypeName(LambdaSig, Option<usize>);
@@ -7408,7 +7537,10 @@ impl Parse for ClosureTypeName {
     ) -> Result<(ClosureTypeName, IndexStr<'b>)> {
         try_begin_parse!("ClosureTypeName", ctx, input);
 
-        let tail = consume(b"Ul", input)?;
+        let mut tail = consume(b"Ul", input)?;
+        while is_template_param_decl(&tail) {
+            tail = skip_template_param_decl(ctx, subs, tail)?;
+        }
         let (sig, tail) = LambdaSig::parse(ctx, subs, tail)?;
         let tail = consume(b"E", tail)?;
         let (num, tail) = if let Ok((num, tail)) = parse_number(10, false, tail) {
@@ -9210,7 +9342,7 @@ mod tests {
                         PrefixHandle::BackReference(1),
                         b"...",
                         [
-                            Substitutable::Prefix(Prefix::TemplateParam(TemplateParam(0))),
+                            Substitutable::Prefix(Prefix::TemplateParam(TemplateParam(0, None))),
                         ]
                     }
                     b"DTtrE..." => {
@@ -9333,7 +9465,7 @@ mod tests {
                         TypeHandle::BackReference(1),
                         b"...",
                         [
-                            Substitutable::Type(Type::TemplateParam(TemplateParam(0))),
+                            Substitutable::Type(Type::TemplateParam(TemplateParam(0, None))),
                         ]
                     }
                     b"T_IS_E..." => {
@@ -9341,7 +9473,7 @@ mod tests {
                         b"...",
                         [
                             Substitutable::TemplateTemplateParam(
-                                TemplateTemplateParam(TemplateParam(0))),
+                                TemplateTemplateParam(TemplateParam(0, None))),
                             Substitutable::Type(
                                 Type::TemplateTemplate(
                                     TemplateTemplateParamHandle::BackReference(1),
@@ -9831,7 +9963,7 @@ mod tests {
     fn parse_template_template_param_handle() {
         assert_parse!(TemplateTemplateParamHandle {
             with subs [
-                Substitutable::TemplateTemplateParam(TemplateTemplateParam(TemplateParam(0)))
+                Substitutable::TemplateTemplateParam(TemplateTemplateParam(TemplateParam(0, None)))
             ] => {
                 Ok => {
                     b"S_..." => {
@@ -9843,7 +9975,7 @@ mod tests {
                         TemplateTemplateParamHandle::BackReference(1),
                         b"...",
                         [
-                            Substitutable::TemplateTemplateParam(TemplateTemplateParam(TemplateParam(2)))
+                            Substitutable::TemplateTemplateParam(TemplateTemplateParam(TemplateParam(2, None)))
                         ]
                     }
                 }
@@ -10402,7 +10534,7 @@ mod tests {
                         []
                     }
                     b"T_..." => {
-                        Expression::TemplateParam(TemplateParam(0)),
+                        Expression::TemplateParam(TemplateParam(0, None)),
                         b"...",
                         []
                     }
@@ -10422,7 +10554,7 @@ mod tests {
                     }
                     b"dtT_3abc..." => {
                         Expression::Member(
-                            Box::new(Expression::TemplateParam(TemplateParam(0))),
+                            Box::new(Expression::TemplateParam(TemplateParam(0, None))),
                             MemberName(
                                 Name::Unscoped(
                                     UnscopedName::Unqualified(
@@ -10438,7 +10570,7 @@ mod tests {
                     }
                     b"ptT_3abc..." => {
                         Expression::DerefMember(
-                            Box::new(Expression::TemplateParam(TemplateParam(0))),
+                            Box::new(Expression::TemplateParam(TemplateParam(0, None))),
                             MemberName(
                                 Name::Unscoped(
                                     UnscopedName::Unqualified(
@@ -10480,13 +10612,13 @@ mod tests {
                     //               ::= ds <expression> <expression>                 # expr.*expr
                     b"dsT_T_..." => {
                         Expression::PointerToMember(
-                            Box::new(Expression::TemplateParam(TemplateParam(0))),
-                            Box::new(Expression::TemplateParam(TemplateParam(0)))),
+                            Box::new(Expression::TemplateParam(TemplateParam(0, None))),
+                            Box::new(Expression::TemplateParam(TemplateParam(0, None)))),
                         b"...",
                         []
                     }
                     b"sZT_..." => {
-                        Expression::SizeofTemplatePack(TemplateParam(0)),
+                        Expression::SizeofTemplatePack(TemplateParam(0, None)),
                         b"...",
                         []
                     }
@@ -10503,7 +10635,7 @@ mod tests {
                     }
                     b"spT_..." => {
                         Expression::PackExpansion(
-                            Box::new(Expression::TemplateParam(TemplateParam(0)))),
+                            Box::new(Expression::TemplateParam(TemplateParam(0, None)))),
                         b"...",
                         []
                     }
@@ -10511,7 +10643,7 @@ mod tests {
                         Expression::Fold(
                             FoldExpr::UnaryLeft(
                                 SimpleOperatorName::Add,
-                                Box::new(Expression::TemplateParam(TemplateParam(0))),
+                                Box::new(Expression::TemplateParam(TemplateParam(0, None))),
                             )
                         ),
                         b"...",
@@ -10521,7 +10653,7 @@ mod tests {
                         Expression::Fold(
                             FoldExpr::UnaryRight(
                                 SimpleOperatorName::LogicalAnd,
-                                Box::new(Expression::TemplateParam(TemplateParam(0))),
+                                Box::new(Expression::TemplateParam(TemplateParam(0, None))),
                             )
                         ),
                         b"...",
@@ -10532,16 +10664,16 @@ mod tests {
                             FoldExpr::BinaryRight(
                                 SimpleOperatorName::LogicalOr,
                                 Box::new(Expression::PackExpansion(
-                                    Box::new(Expression::TemplateParam(TemplateParam(0))))),
+                                    Box::new(Expression::TemplateParam(TemplateParam(0, None))))),
                                 Box::new(Expression::PackExpansion(
-                                    Box::new(Expression::TemplateParam(TemplateParam(1))))),
+                                    Box::new(Expression::TemplateParam(TemplateParam(1, None))))),
                             )
                         ),
                         b"...",
                         []
                     }
                     b"twT_..." => {
-                        Expression::Throw(Box::new(Expression::TemplateParam(TemplateParam(0)))),
+                        Expression::Throw(Box::new(Expression::TemplateParam(TemplateParam(0, None)))),
                         b"...",
                         []
                     }
@@ -10621,7 +10753,7 @@ mod tests {
                         ),
                         b"...",
                         [
-                            Substitutable::UnresolvedType(UnresolvedType::Template(TemplateParam(0), None))
+                            Substitutable::UnresolvedType(UnresolvedType::Template(TemplateParam(0, None), None))
                         ]
                     }
                 }
@@ -10756,7 +10888,7 @@ mod tests {
                         b"...",
                         [
                             Substitutable::UnresolvedType(
-                                UnresolvedType::Template(TemplateParam(0), None)),
+                                UnresolvedType::Template(TemplateParam(0, None), None)),
                         ]
                     }
                     b"T_IS_E..." => {
@@ -10764,7 +10896,7 @@ mod tests {
                         b"...",
                         [
                             Substitutable::UnresolvedType(
-                                UnresolvedType::Template(TemplateParam(0), Some(TemplateArgs(vec![
+                                UnresolvedType::Template(TemplateParam(0, None), Some(TemplateArgs(vec![
                                     TemplateArg::Type(TypeHandle::BackReference(0))
                                 ])))),
                         ]
@@ -11616,7 +11748,7 @@ mod tests {
                     b"..."
                 }
                 b"DUsZT_" => {
-                    BuiltinType::Parametric(ParametricBuiltinType::UnsignedBitIntExpression(Box::new(Expression::SizeofTemplatePack(TemplateParam(0))))),
+                    BuiltinType::Parametric(ParametricBuiltinType::UnsignedBitIntExpression(Box::new(Expression::SizeofTemplatePack(TemplateParam(0, None))))),
                     b""
                 }
                 b"DF128_..." => {
@@ -11642,11 +11774,11 @@ mod tests {
         assert_parse!(TemplateParam {
             Ok => {
                 b"T_..." => {
-                    TemplateParam(0),
+                    TemplateParam(0, None),
                     b"..."
                 }
                 b"T3_..." => {
-                    TemplateParam(4),
+                    TemplateParam(4, None),
                     b"..."
                 }
             }
