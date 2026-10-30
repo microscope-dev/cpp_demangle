@@ -1,16 +1,15 @@
 # microscope's cpp_demangle fork
 
-The `microscope-cpp20` branch is based on upstream commit `6fc3a53`
-(cpp_demangle 0.5.1), with the parser changes in `src/ast.rs`. Without the
-change, 0.5.1 can't parse several C++20 manglings that clang emits and
-Chromium is full of, so their names stay mangled in profiles. The parts added here:
+The `microscope-cpp20` branch includes upstream `master` through commit
+`076632f` and keeps microscope's additional C++20 support and safe Rust
+implementation. Upstream supplies non-type and pack parameter declarations,
+requires clauses, `_BitInt` substitution fixes, member-like friends,
+`co_await`, and clone-suffix filtering. The fork adds:
 
-- Template parameter declarations (`Ty`, `Tk`, `Tn`, `Tt`, `Tp`) in template
-  argument lists and in lambda signatures (`Ul`). They are skipped, as
-  llvm-cxxfilt does. A `Tk` constraint's name still counts as a substitution
-  candidate, so later `S_` references still resolve.
-- Requires clauses (`Q <expression>`) in template arguments and after a
-  function's parameter types. They are parsed and dropped.
+- Type (`Ty`), constrained (`Tk`), and template (`Tt`) parameter declarations
+  in upstream's `TemplateParamDecl` AST, also used for lambda signatures
+  (`Ul`). Declarations and requires clauses are parsed but omitted from
+  rendered arguments. Constraint names remain substitution candidates.
 - Template parameters of an enclosing level (`TL<level>_<index>_`). They print
   as `$T` / `$TN` like llvm-cxxfilt, since the demangler doesn't track which
   level's arguments are in scope.

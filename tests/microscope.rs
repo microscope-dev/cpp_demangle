@@ -74,6 +74,8 @@ fn empty_packs_do_not_leave_commas() {
     for (mangled, expected) in [
         ("_Z1fIJEEvDpT_", "void f<>()"),
         ("_Z1fIiJEEvT_DpT0_", "void f<int>(int)"),
+        ("_Z1fITpTyJEEvDpT_", "void f<>()"),
+        ("_Z1fIiTpTyJEEvT_DpT0_", "void f<int>(int)"),
     ] {
         assert_eq!(demangle(mangled).as_deref(), Some(expected), "{}", mangled);
     }

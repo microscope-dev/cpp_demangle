@@ -930,7 +930,7 @@ fn expands_empty_pack<'subs, 'prev>(
             Some(&Type::TemplateParam(ref param)) => {
                 return matches!(
                     param.resolve(scope),
-                    Ok(&TemplateArg::ArgPack(ref args)) if args.is_empty()
+                    Ok(arg) if arg.is_empty_pack()
                 );
             }
             _ => return false,
@@ -1376,14 +1376,14 @@ where
 /// The `<encoding>` production.
 ///
 /// ```text
-/// <encoding> ::= <function name> <bare-function-type>
+/// <encoding> ::= <function name> <bare-function-type> [Q <requires-clause expr>]
 ///            ::= <data name>
 ///            ::= <special-name>
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Encoding {
     /// An encoded function.
-    Function(Name, BareFunctionType),
+    Function(Name, BareFunctionType, ConstraintExpression),
 
     /// An encoded static variable.
     Data(Name),
@@ -1402,8 +1402,8 @@ impl Parse for Encoding {
 
         if let Ok((name, tail)) = try_recurse!(Name::parse(ctx, subs, input)) {
             if let Ok((ty, tail)) = try_recurse!(BareFunctionType::parse(ctx, subs, tail)) {
-                let tail = skip_requires_clause(ctx, subs, tail)?;
-                return Ok((Encoding::Function(name, ty), tail));
+                let (requires_clause, tail) = ConstraintExpression::parse(ctx, subs, tail)?;
+                return Ok((Encoding::Function(name, ty, requires_clause), tail));
             } else {
                 return Ok((Encoding::Data(name), tail));
             }
@@ -1427,7 +1427,7 @@ where
         inner_barrier!(ctx);
 
         match *self {
-            Encoding::Function(ref name, ref fun_ty) => {
+            Encoding::Function(ref name, ref fun_ty, _) => {
                 // Even if this function takes no args and doesn't have a return
                 // value (see below), it will have the void parameter.
                 debug_assert!(!fun_ty.0.is_empty());
@@ -1498,7 +1498,7 @@ where
         ctx: &'ctx mut DemangleContext<'subs, W>,
         scope: Option<ArgScopeStack<'prev, 'subs>>,
     ) -> fmt::Result {
-        if let Encoding::Function(ref name, ref fun_ty) = *self {
+        if let Encoding::Function(ref name, ref fun_ty, _) = *self {
             // A template function's types start with its return type.
             if let Some(template_args) = name.get_template_args(ctx.subs) {
                 demangle_function_args(&fun_ty.0[1..], ctx, scope.push(template_args))
@@ -1548,12 +1548,18 @@ where
         scope: Option<ArgScopeStack<'prev, 'subs>>,
     ) -> fmt::Result {
         let ctx = try_begin_demangle!(self, ctx, scope);
+
+        ctx.push_demangle_node(DemangleNodeType::CloneSuffix);
+
         write!(ctx, " [clone")?;
         self.0.demangle(ctx, scope)?;
         for nonnegative in &self.1 {
             write!(ctx, ".{}", nonnegative)?;
         }
         write!(ctx, "]")?;
+
+        ctx.pop_demangle_node();
+
         Ok(())
     }
 }
@@ -1765,6 +1771,15 @@ impl Parse for UnscopedName {
         if let Ok(tail) = consume(b"St", input) {
             let (name, tail) = UnqualifiedName::parse(ctx, subs, tail)?;
             return Ok((UnscopedName::Std(name), tail));
+        }
+
+        // NB: Because this is unscoped, we shouldn't see a MemberLikeFriend
+        // here. But UnqualifiedName::parse isn't smart enough to know that,
+        // so guard here. We could use UnqualifiedName::starts_with but that
+        // checks for a bunch of other cases too that we can just let the
+        // Parse impl try to bite on.
+        if input.peek() == Some(b'F') {
+            return Err(error::Error::UnexpectedText);
         }
 
         let (name, tail) = UnqualifiedName::parse(ctx, subs, input)?;
@@ -2274,7 +2289,7 @@ impl Parse for PrefixHandle {
                     current = Some(save(subs, prefix, tail_tail));
                     tail = tail_tail;
                 }
-                Some(c) if UnqualifiedName::starts_with(c, &tail) => {
+                Some(c) if UnqualifiedName::starts_with(c, current.is_none(), &tail) => {
                     // Either
                     //
                     //     <prefix> ::= <unqualified-name>
@@ -2291,7 +2306,7 @@ impl Parse for PrefixHandle {
                             None => Prefix::Unqualified(name),
                             Some(current) => {
                                 let name = match name {
-                                    UnqualifiedName::Source(name, _) => name,
+                                    UnqualifiedName::Source(name, ..) => name,
                                     UnqualifiedName::LocalSourceName(name, ..) => name,
                                     _ => return Err(error::Error::UnexpectedText),
                                 };
@@ -2452,12 +2467,24 @@ impl PrefixHandle {
     }
 }
 
+/// In certain circumstances a friend function is treated like a member function
+/// for name mangling purposes. See [temp.friend]/9. When that happens, it's
+/// distinguished from a true member function by this flag.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemberLikeFriend {
+    /// This is a normal definition.
+    #[default]
+    NotFriend,
+    /// This is a special "member-like friend" definition.
+    Friend,
+}
+
 /// The `<unqualified-name>` production.
 ///
 /// ```text
 /// <unqualified-name> ::= [on] <operator-name> [<abi-tags>]
 ///                    ::= <ctor-dtor-name> [<abi-tags>]
-///                    ::= <source-name> [<abi-tags>]
+///                    ::= F? <source-name> [<abi-tags>]
 ///                    ::= <local-source-name> [<abi-tags>]
 ///                    ::= <unnamed-type-name> [<abi-tags>]
 ///                    ::= <closure-type-name> [<abi-tags>]
@@ -2473,7 +2500,7 @@ pub enum UnqualifiedName {
     /// A constructor or destructor name.
     CtorDtor(CtorDtorName, AbiTags),
     /// A source name.
-    Source(SourceName, AbiTags),
+    Source(SourceName, MemberLikeFriend, AbiTags),
     /// A local source name.
     LocalSourceName(SourceName, Option<Discriminator>, AbiTags),
     /// A generated name for an unnamed type.
@@ -2520,7 +2547,20 @@ impl Parse for UnqualifiedName {
 
         if let Ok((source, tail)) = try_recurse!(SourceName::parse(ctx, subs, input)) {
             let (abi_tags, tail) = AbiTags::parse(ctx, subs, tail)?;
-            return Ok((UnqualifiedName::Source(source, abi_tags), tail));
+            return Ok((
+                UnqualifiedName::Source(source, MemberLikeFriend::NotFriend, abi_tags),
+                tail,
+            ));
+        }
+
+        if let Ok(tail) = consume(b"F", input) {
+            if let Ok((source, tail)) = try_recurse!(SourceName::parse(ctx, subs, tail)) {
+                let (abi_tags, tail) = AbiTags::parse(ctx, subs, tail)?;
+                return Ok((
+                    UnqualifiedName::Source(source, MemberLikeFriend::Friend, abi_tags),
+                    tail,
+                ));
+            }
         }
 
         if let Ok((closure, tail)) = try_recurse!(ClosureTypeName::parse(ctx, subs, input)) {
@@ -2556,8 +2596,14 @@ where
                 ctor_dtor.demangle(ctx, scope)?;
                 abi_tags.demangle(ctx, scope)
             }
-            UnqualifiedName::Source(ref name, ref abi_tags)
-            | UnqualifiedName::LocalSourceName(ref name, _, ref abi_tags) => {
+            UnqualifiedName::Source(ref name, member_like_friend, ref abi_tags) => {
+                if member_like_friend == MemberLikeFriend::Friend {
+                    write!(ctx, "friend ")?;
+                }
+                name.demangle(ctx, scope)?;
+                abi_tags.demangle(ctx, scope)
+            }
+            UnqualifiedName::LocalSourceName(ref name, _, ref abi_tags) => {
                 name.demangle(ctx, scope)?;
                 abi_tags.demangle(ctx, scope)
             }
@@ -2581,7 +2627,7 @@ impl<'a> GetLeafName<'a> for UnqualifiedName {
             UnqualifiedName::Operator(..) | UnqualifiedName::CtorDtor(..) => None,
             UnqualifiedName::UnnamedType(ref name, _) => Some(LeafName::UnnamedType(name)),
             UnqualifiedName::ClosureType(ref closure, _) => closure.get_leaf_name(subs),
-            UnqualifiedName::Source(ref name, _)
+            UnqualifiedName::Source(ref name, ..)
             | UnqualifiedName::LocalSourceName(ref name, ..) => Some(LeafName::SourceName(name)),
         }
     }
@@ -2603,8 +2649,9 @@ impl IsCtorDtorConversion for UnqualifiedName {
 
 impl UnqualifiedName {
     #[inline]
-    fn starts_with(byte: u8, input: &IndexStr) -> bool {
+    fn starts_with(byte: u8, first: bool, input: &IndexStr) -> bool {
         byte == b'L'
+            || (byte == b'F' && !first)
             || OperatorName::starts_with(byte)
             || CtorDtorName::starts_with(byte)
             || SourceName::starts_with(byte)
@@ -3106,7 +3153,8 @@ where
                     SimpleOperatorName::New
                     | SimpleOperatorName::NewArray
                     | SimpleOperatorName::Delete
-                    | SimpleOperatorName::DeleteArray => {
+                    | SimpleOperatorName::DeleteArray
+                    | SimpleOperatorName::CoAwait => {
                         ctx.ensure_space()?;
                     }
                     _ => {}
@@ -3193,7 +3241,8 @@ define_vocabulary! {
         Call             (b"cl",  "()",       2),
         Index            (b"ix",  "[]",       2),
         Question         (b"qu",  "?:",       3),
-        Spaceship        (b"ss",  "<=>",      2)
+        Spaceship        (b"ss",  "<=>",      2),
+        CoAwait          (b"aw",  "co_await", 1)
     }
 
     impl SimpleOperatorName {
@@ -3558,6 +3607,11 @@ pub enum Type {
 
     /// A pack expansion.
     PackExpansion(TypeHandle),
+
+    /// Builtin type eligible for substitutions, e.g. vendor extended type or _BitInt(N).
+    /// Note: most builtin types are excluded from substitutions, and we store them directly
+    /// in TypeHandle without creating a Type.
+    Builtin(BuiltinType),
 }
 
 define_handle! {
@@ -3604,6 +3658,30 @@ impl Parse for TypeHandle {
         if let Ok((builtin, tail)) = try_recurse!(BuiltinType::parse(ctx, subs, input)) {
             // Builtin types are one of two exceptions that do not end up in the
             // substitutions table.
+
+            // But there are exceptions to the exception:
+            //  * "vendor extended type" builtin types do go in the substitution table.
+            //  * Quirk: clang treats `_BitInt` types (`DB<n>_`, `DU<n>_`) as substitutable,
+            //    even though they're <builtin-type>. This contradicts the current Itanium ABI spec.
+            //    This behavior is consistent between clang's mangler and demangler.
+            //    It seems more likely that the ABI spec will be changed to match clang, rather than
+            //    the other way around. So we do what clang does and put _BitInt-s into the substitution table.
+            let substitutable = match &builtin {
+                BuiltinType::Parametric(p) => match p {
+                    ParametricBuiltinType::SignedBitInt(_)
+                    | ParametricBuiltinType::UnsignedBitInt(_)
+                    | ParametricBuiltinType::SignedBitIntExpression(_)
+                    | ParametricBuiltinType::UnsignedBitIntExpression(_) => true,
+                    _ => false,
+                },
+                BuiltinType::Extension(_) => true,
+                _ => false,
+            };
+            if substitutable {
+                let ty = Type::Builtin(builtin);
+                return insert_and_return_handle(ty, subs, tail);
+            }
+
             let handle = TypeHandle::Builtin(builtin);
             return Ok((handle, tail));
         }
@@ -3847,6 +3925,7 @@ where
                 }
                 Ok(())
             }
+            Type::Builtin(ref builtin) => builtin.demangle(ctx, scope),
         }
     }
 }
@@ -4248,6 +4327,7 @@ impl Parse for ParametricBuiltinType {
             Ok((t, input))
         } else if allow_expression {
             let (expr, input) = Expression::parse(ctx, subs, input)?;
+            let input = consume(b"_", input)?;
             let expr = Box::new(expr);
             let t = match ch {
                 b'B' => ParametricBuiltinType::SignedBitIntExpression(expr),
@@ -4275,10 +4355,10 @@ where
         match *self {
             Self::FloatN(n) => write!(ctx, "_Float{}", n),
             Self::FloatNx(n) => write!(ctx, "_Float{}x", n),
-            Self::SignedBitInt(n) => write!(ctx, "signed _BitInt({})", n),
+            Self::SignedBitInt(n) => write!(ctx, "_BitInt({})", n),
             Self::UnsignedBitInt(n) => write!(ctx, "unsigned _BitInt({})", n),
             Self::SignedBitIntExpression(ref expr) => {
-                write!(ctx, "signed _BitInt(")?;
+                write!(ctx, "_BitInt(")?;
                 expr.demangle(ctx, scope)?;
                 write!(ctx, ")")
             }
@@ -5374,6 +5454,103 @@ where
     }
 }
 
+/// The `<template-param-decl>` production.
+///
+/// ```text
+/// <template-param-decl> ::= Ty                                  # type parameter
+///                       ::= Tk <type-constraint> [<template-args>] # constrained type parameter
+///                       ::= Tn <type>                           # non-type parameter
+///                       ::= Tt <template-param-decl>* [Q <expression>] E # template template parameter
+///                       ::= Tp <template-param-decl>            # parameter pack
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TemplateParamDecl {
+    /// A type parameter.
+    Type,
+    /// A type parameter constrained by a concept.
+    ConstrainedType(Name),
+    /// A template parameter, its own parameters, and its requires clause.
+    Template(Vec<TemplateParamDecl>, ConstraintExpression),
+    /// A non-type parameter.
+    NonType(TypeHandle),
+    /// A parameter pack.
+    ParameterPack(Box<TemplateParamDecl>),
+}
+
+impl Parse for TemplateParamDecl {
+    fn parse<'a, 'b>(
+        ctx: &'a ParseContext,
+        subs: &'a mut SubstitutionTable,
+        input: IndexStr<'b>,
+    ) -> Result<(TemplateParamDecl, IndexStr<'b>)> {
+        try_begin_parse!("TemplateParamDecl", ctx, input);
+
+        let input = consume(b"T", input)?;
+        if let Ok(tail) = consume(b"y", input) {
+            return Ok((TemplateParamDecl::Type, tail));
+        }
+
+        if let Ok(tail) = consume(b"k", input) {
+            let (constraint, tail) = Name::parse(ctx, subs, tail)?;
+            return Ok((TemplateParamDecl::ConstrainedType(constraint), tail));
+        }
+
+        if let Ok(mut tail) = consume(b"t", input) {
+            let mut params = vec![];
+            while is_template_param_decl(&tail) {
+                let (param, next) = TemplateParamDecl::parse(ctx, subs, tail)?;
+                params.push(param);
+                tail = next;
+            }
+            let (requires_clause, tail) = ConstraintExpression::parse(ctx, subs, tail)?;
+            let tail = consume(b"E", tail)?;
+            return Ok((TemplateParamDecl::Template(params, requires_clause), tail));
+        }
+
+        if let Ok(tail) = consume(b"n", input) {
+            let (ty, tail) = TypeHandle::parse(ctx, subs, tail)?;
+            return Ok((TemplateParamDecl::NonType(ty), tail));
+        }
+
+        if let Ok(tail) = consume(b"p", input) {
+            let (param_decl, tail) = TemplateParamDecl::parse(ctx, subs, tail)?;
+            return Ok((TemplateParamDecl::ParameterPack(Box::new(param_decl)), tail));
+        }
+
+        Err(error::Error::UnexpectedText)
+    }
+}
+
+impl<'subs, W> Demangle<'subs, W> for TemplateParamDecl
+where
+    W: 'subs + DemangleWrite,
+{
+    fn demangle<'prev, 'ctx>(
+        &'subs self,
+        ctx: &'ctx mut DemangleContext<'subs, W>,
+        scope: Option<ArgScopeStack<'prev, 'subs>>,
+    ) -> fmt::Result {
+        let ctx = try_begin_demangle!(self, ctx, scope);
+
+        match self {
+            TemplateParamDecl::Type => write!(ctx, "typename"),
+            TemplateParamDecl::ConstrainedType(ref constraint) => constraint.demangle(ctx, scope),
+            TemplateParamDecl::Template(ref params, _) => {
+                write!(ctx, "template<")?;
+                for (index, param) in params.iter().enumerate() {
+                    if index != 0 {
+                        write!(ctx, ", ")?;
+                    }
+                    param.demangle(ctx, scope)?;
+                }
+                write!(ctx, "> typename")
+            }
+            TemplateParamDecl::NonType(ref ty) => ty.demangle(ctx, scope),
+            TemplateParamDecl::ParameterPack(ref pack) => pack.demangle(ctx, scope),
+        }
+    }
+}
+
 /// The <function-param> production.
 ///
 /// ```text
@@ -5445,10 +5622,13 @@ where
 /// The `<template-args>` production.
 ///
 /// ```text
-/// <template-args> ::= I <template-arg>+ E
+/// <template-args> ::= I <template-arg>+ [Q <requires-clause expr>] E
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TemplateArgs(Vec<TemplateArg>);
+pub struct TemplateArgs {
+    args: Vec<TemplateArg>,
+    requires_clause: ConstraintExpression,
+}
 
 impl Parse for TemplateArgs {
     fn parse<'a, 'b>(
@@ -5461,9 +5641,15 @@ impl Parse for TemplateArgs {
         let tail = consume(b"I", input)?;
 
         let (args, tail) = one_or_more::<TemplateArg>(ctx, subs, tail)?;
-        let tail = skip_requires_clause(ctx, subs, tail)?;
+        let (requires_clause, tail) = ConstraintExpression::parse(ctx, subs, tail)?;
         let tail = consume(b"E", tail)?;
-        Ok((TemplateArgs(args), tail))
+        Ok((
+            TemplateArgs {
+                args: args,
+                requires_clause: requires_clause,
+            },
+            tail,
+        ))
     }
 }
 
@@ -5485,10 +5671,10 @@ where
         write!(ctx, "<")?;
         ctx.push_demangle_node(DemangleNodeType::TemplateArgs);
         let mut need_comma = false;
-        for arg_index in 0..self.0.len() {
+        for arg_index in 0..self.args.len() {
             // An empty pack adds no argument, nor a comma before it
             // (microscope's patch).
-            if matches!(self.0[arg_index], TemplateArg::ArgPack(ref args) if args.is_empty()) {
+            if self.args[arg_index].is_empty_pack() {
                 continue;
             }
             if need_comma {
@@ -5497,8 +5683,12 @@ where
             if let Some(ref mut scope) = scope {
                 scope.in_arg = Some((arg_index, self));
             }
-            self.0[arg_index].demangle(ctx, scope)?;
+            self.args[arg_index].demangle(ctx, scope)?;
             need_comma = true;
+        }
+
+        if let Some(ref mut scope) = scope {
+            scope.in_arg = None;
         }
 
         // Ensure "> >" because old C++ sucks and libiberty (and its tests)
@@ -5521,7 +5711,7 @@ impl<'subs> ArgScope<'subs, 'subs> for TemplateArgs {
         &'subs self,
         idx: usize,
     ) -> Result<(&'subs TemplateArg, &'subs TemplateArgs)> {
-        self.0
+        self.args
             .get(idx)
             .ok_or(error::Error::BadTemplateArgReference)
             .map(|v| (v, self))
@@ -5539,6 +5729,7 @@ impl<'subs> ArgScope<'subs, 'subs> for TemplateArgs {
 ///                ::= X <expression> E      # expression
 ///                ::= <expr-primary>        # simple expressions
 ///                ::= J <template-arg>* E   # argument pack
+///                ::= <template-param-decl> <template-arg> #
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TemplateArg {
@@ -5553,6 +5744,20 @@ pub enum TemplateArg {
 
     /// An argument pack.
     ArgPack(Vec<TemplateArg>),
+
+    /// A <template-param-decl> followed by an additional <template-arg>.
+    ParamDecl(TemplateParamDecl, Box<TemplateArg>),
+}
+
+impl TemplateArg {
+    /// Whether this argument binds an empty pack, with or without a declaration.
+    fn is_empty_pack(&self) -> bool {
+        let mut arg = self;
+        while let TemplateArg::ParamDecl(_, inner) = arg {
+            arg = inner;
+        }
+        matches!(arg, TemplateArg::ArgPack(args) if args.is_empty())
+    }
 }
 
 /// Whether `input` begins with C++20's `<template-param-decl>`.
@@ -5564,60 +5769,6 @@ fn is_template_param_decl(input: &IndexStr) -> bool {
         )
 }
 
-/// Skips C++20's `<template-param-decl>`, which declares the parameter a
-/// template argument binds, and returns what follows. A constraint's name
-/// is parsed as any name is, so that it is a substitution candidate.
-///
-/// ```text
-/// <template-param-decl> ::= Ty                                  # type parameter
-///                       ::= Tk <type-constraint> [<template-args>] # constrained type parameter
-///                       ::= Tn <type>                           # non-type parameter
-///                       ::= Tt <template-param-decl>* [Q <expression>] E # template template parameter
-///                       ::= Tp <template-param-decl>            # parameter pack
-/// ```
-///
-/// microscope's patch: libiberty and llvm-cxxfilt print the argument only.
-fn skip_template_param_decl<'a, 'b>(
-    ctx: &'a ParseContext,
-    subs: &'a mut SubstitutionTable,
-    input: IndexStr<'b>,
-) -> Result<IndexStr<'b>> {
-    let _guard = AutoParseRecursion::new(ctx)?;
-    if let Ok(tail) = consume(b"Ty", input) {
-        return Ok(tail);
-    }
-    if let Ok(tail) = consume(b"Tk", input) {
-        let (_, tail) = Name::parse(ctx, subs, tail)?;
-        return Ok(tail);
-    }
-    if let Ok(tail) = consume(b"Tn", input) {
-        let (_, tail) = TypeHandle::parse(ctx, subs, tail)?;
-        return Ok(tail);
-    }
-    if let Ok(mut tail) = consume(b"Tt", input) {
-        while is_template_param_decl(&tail) {
-            tail = skip_template_param_decl(ctx, subs, tail)?;
-        }
-        tail = skip_requires_clause(ctx, subs, tail)?;
-        return consume(b"E", tail);
-    }
-    let tail = consume(b"Tp", input)?;
-    skip_template_param_decl(ctx, subs, tail)
-}
-
-/// Skips a C++20 requires clause, `Q <expression>`, if `input` begins with
-/// one (microscope's patch).
-fn skip_requires_clause<'a, 'b>(
-    ctx: &'a ParseContext,
-    subs: &'a mut SubstitutionTable,
-    input: IndexStr<'b>,
-) -> Result<IndexStr<'b>> {
-    match consume(b"Q", input) {
-        Ok(tail) => Expression::parse(ctx, subs, tail).map(|(_, tail)| tail),
-        Err(_) => Ok(input),
-    }
-}
-
 impl Parse for TemplateArg {
     fn parse<'a, 'b>(
         ctx: &'a ParseContext,
@@ -5627,8 +5778,9 @@ impl Parse for TemplateArg {
         try_begin_parse!("TemplateArg", ctx, input);
 
         if is_template_param_decl(&input) {
-            let tail = skip_template_param_decl(ctx, subs, input)?;
-            return TemplateArg::parse(ctx, subs, tail);
+            let (decl, tail) = TemplateParamDecl::parse(ctx, subs, input)?;
+            let (arg, tail) = TemplateArg::parse(ctx, subs, tail)?;
+            return Ok((TemplateArg::ParamDecl(decl, Box::new(arg)), tail));
         }
 
         if let Ok(tail) = consume(b"X", input) {
@@ -5687,6 +5839,10 @@ where
                     need_comma = true;
                 }
                 Ok(())
+            }
+            TemplateArg::ParamDecl(_, ref arg) => {
+                // llvm-cxxfilt doesn't print the param.
+                arg.demangle(ctx, scope)
             }
         }
     }
@@ -6630,6 +6786,30 @@ impl Expression {
     }
 }
 
+/// `[Q <requires-clause expr>` appears in multiple places but is not actually
+/// defined as its own separate production by the spec. Due to the Rust type
+/// system it's convenient for us to handle the optionality inside a newtype,
+/// hence ConstraintExpression.
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
+pub struct ConstraintExpression(Option<Box<Expression>>);
+
+impl Parse for ConstraintExpression {
+    fn parse<'a, 'b>(
+        ctx: &'a ParseContext,
+        subs: &'a mut SubstitutionTable,
+        input: IndexStr<'b>,
+    ) -> Result<(ConstraintExpression, IndexStr<'b>)> {
+        try_begin_parse!("ConstraintExpression", ctx, input);
+
+        if let Ok(tail) = consume(b"Q", input) {
+            let (expr, tail) = Expression::parse(ctx, subs, tail)?;
+            return Ok((ConstraintExpression(Some(Box::new(expr))), tail));
+        }
+
+        Ok((ConstraintExpression(None), input))
+    }
+}
+
 /// The `<unresolved-name>` production.
 ///
 /// ```text
@@ -7442,7 +7622,8 @@ impl Parse for ClosureTypeName {
 
         let mut tail = consume(b"Ul", input)?;
         while is_template_param_decl(&tail) {
-            tail = skip_template_param_decl(ctx, subs, tail)?;
+            let (_, next) = TemplateParamDecl::parse(ctx, subs, tail)?;
+            tail = next;
         }
         let (sig, tail) = LambdaSig::parse(ctx, subs, tail)?;
         let tail = consume(b"E", tail)?;
@@ -8429,13 +8610,14 @@ fn parse_number(base: u32, allow_signed: bool, mut input: IndexStr) -> Result<(i
 mod tests {
     use super::{
         AbiTag, AbiTags, ArrayType, BareFunctionType, BaseUnresolvedName, BuiltinType, CallOffset,
-        ClassEnumType, ClosureTypeName, CtorDtorName, CvQualifiers, DataMemberPrefix, Decltype,
-        DestructorName, Discriminator, Encoding, ExceptionSpec, ExprPrimary, Expression, FoldExpr,
-        FunctionParam, FunctionType, GlobalCtorDtor, Identifier, Initializer, LambdaSig, LocalName,
-        MangledName, MemberName, Name, NestedName, NonSubstitution, Number, NvOffset, OperatorName,
-        ParametricBuiltinType, Parse, ParseContext, PointerToMemberType, Prefix, PrefixHandle,
-        RefQualifier, ResourceName, SeqId, SimpleId, SimpleOperatorName, SourceName, SpecialName,
-        StandardBuiltinType, SubobjectExpr, Substitution, TemplateArg, TemplateArgs, TemplateParam,
+        ClassEnumType, ClosureTypeName, ConstraintExpression, CtorDtorName, CvQualifiers,
+        DataMemberPrefix, Decltype, DestructorName, Discriminator, Encoding, ExceptionSpec,
+        ExprPrimary, Expression, FoldExpr, FunctionParam, FunctionType, GlobalCtorDtor, Identifier,
+        Initializer, LambdaSig, LocalName, MangledName, MemberName, Name, NestedName,
+        NonSubstitution, Number, NvOffset, OperatorName, ParametricBuiltinType, Parse,
+        ParseContext, PointerToMemberType, Prefix, PrefixHandle, RefQualifier, ResourceName, SeqId,
+        SimpleId, SimpleOperatorName, SourceName, SpecialName, StandardBuiltinType, SubobjectExpr,
+        Substitution, TemplateArg, TemplateArgs, TemplateParam, TemplateParamDecl,
         TemplateTemplateParam, TemplateTemplateParamHandle, Type, TypeHandle, UnnamedTypeName,
         UnqualifiedName, UnresolvedName, UnresolvedQualifierLevel, UnresolvedType,
         UnresolvedTypeHandle, UnscopedName, UnscopedTemplateName, UnscopedTemplateNameHandle,
@@ -8668,6 +8850,7 @@ mod tests {
                                             start: 3,
                                             end: 6,
                                         }),
+                                        Default::default(),
                                         AbiTags::default())))), vec![]),
                     b"..."
                 }
@@ -8685,6 +8868,7 @@ mod tests {
                                                             start: 14,
                                                             end: 17,
                                                         }),
+                                                    Default::default(),
                                                     AbiTags::default())))), vec![])))),
                     b"..."
                 }
@@ -8713,10 +8897,13 @@ mod tests {
                                             start: 1,
                                             end: 4,
                                         }),
+                                        Default::default(),
                                         AbiTags::default()))),
                             BareFunctionType(vec![
                                 TypeHandle::Builtin(BuiltinType::Standard(StandardBuiltinType::Int))
-                            ])),
+                            ]),
+                            Default::default(),
+                        ),
                         b"...",
                         []
                     }
@@ -8729,6 +8916,7 @@ mod tests {
                                             start: 1,
                                             end: 4,
                                         }),
+                                        Default::default(),
                                         AbiTags::default())))),
                         b"...",
                         []
@@ -8743,6 +8931,7 @@ mod tests {
                                                 start: 3,
                                                 end: 6,
                                             }),
+                                            Default::default(),
                                             AbiTags::default()))))),
                         b"...",
                         []
@@ -8773,6 +8962,7 @@ mod tests {
                                                         start: 6,
                                                         end: 9,
                                                     }),
+                                                Default::default(),
                                                 AbiTags::default())))), vec![]))),
                     b"..."
                 }
@@ -8789,6 +8979,7 @@ mod tests {
                                                         start: 6,
                                                         end: 9,
                                                     }),
+                                                Default::default(),
                                                 AbiTags::default())))), vec![]))),
                     b"..."
                 }
@@ -8805,6 +8996,7 @@ mod tests {
                                                         start: 6,
                                                         end: 9,
                                                     }),
+                                                Default::default(),
                                                 AbiTags::default())))), vec![]))),
                     b"..."
                 }
@@ -8821,6 +9013,7 @@ mod tests {
                                                         start: 6,
                                                         end: 9,
                                                     }),
+                                                Default::default(),
                                                 AbiTags::default())))), vec![]))),
                     b"..."
                 }
@@ -8837,6 +9030,7 @@ mod tests {
                                                         start: 6,
                                                         end: 9,
                                                     }),
+                                                Default::default(),
                                                 AbiTags::default())))), vec![]))),
                     b"..."
                 }
@@ -8853,6 +9047,7 @@ mod tests {
                                                         start: 6,
                                                         end: 9,
                                                     }),
+                                                Default::default(),
                                                 AbiTags::default())))), vec![]))),
                     b"..."
                 }
@@ -8886,10 +9081,13 @@ mod tests {
                         Name::Nested(NestedName::Unqualified(CvQualifiers::default(),
                                                              None,
                                                              Some(PrefixHandle::BackReference(1)),
-                                                             UnqualifiedName::Source(SourceName(Identifier {
-                                                                 start: 5,
-                                                                 end: 8,
-                                                             }), AbiTags::default()))),
+                                                             UnqualifiedName::Source(
+                                                                 SourceName(Identifier {
+                                                                     start: 5,
+                                                                     end: 8,
+                                                                 }),
+                                                                 Default::default(),
+                                                                 AbiTags::default()))),
                         b"...",
                         []
                     }
@@ -8901,6 +9099,7 @@ mod tests {
                                         start: 1,
                                         end: 4,
                                     }),
+                                    Default::default(),
                                     AbiTags::default()))),
                         b"...",
                         []
@@ -8908,11 +9107,14 @@ mod tests {
                     b"dlIcE..." => {
                         Name::UnscopedTemplate(
                             UnscopedTemplateNameHandle::BackReference(2),
-                            TemplateArgs(vec![
-                                TemplateArg::Type(
-                                    TypeHandle::Builtin(
-                                        BuiltinType::Standard(StandardBuiltinType::Char)))
-                            ])),
+                            TemplateArgs {
+                                args: vec![
+                                    TemplateArg::Type(
+                                        TypeHandle::Builtin(
+                                            BuiltinType::Standard(StandardBuiltinType::Char)))
+                                ],
+                                requires_clause: ConstraintExpression(None),
+                            }),
                         b"...",
                         [
                             Substitutable::UnscopedTemplateName(
@@ -8935,6 +9137,7 @@ mod tests {
                                                     start: 2,
                                                     end: 5,
                                                 }),
+                                                Default::default(),
                                                 AbiTags::default()))))),
                                 None,
                                 None)),
@@ -9018,6 +9221,7 @@ mod tests {
                                     start: 6,
                                     end: 9,
                                 }),
+                                Default::default(),
                                 AbiTags::default())),
                         b"...",
                         []
@@ -9035,7 +9239,9 @@ mod tests {
                                 SourceName(Identifier {
                                     start: 5,
                                     end: 8,
-                                }), AbiTags::default())),
+                                }),
+                                Default::default(),
+                                AbiTags::default())),
                         b"...",
                         []
                     }
@@ -9052,7 +9258,9 @@ mod tests {
                                 SourceName(Identifier {
                                     start: 4,
                                     end: 7,
-                                }), AbiTags::default())),
+                                }),
+                                Default::default(),
+                                AbiTags::default())),
                         b"...",
                         []
                     }
@@ -9070,6 +9278,7 @@ mod tests {
                                     start: 3,
                                     end: 4,
                                 }),
+                                Default::default(),
                                 AbiTags::default())),
                         b"...",
                         []
@@ -9093,6 +9302,7 @@ mod tests {
                                             start: 6,
                                             end: 9,
                                         }),
+                                        Default::default(),
                                         AbiTags::default()))),
                         ]
                     }
@@ -9115,6 +9325,7 @@ mod tests {
                                             start: 5,
                                             end: 8,
                                         }),
+                                        Default::default(),
                                         AbiTags::default()))),
                         ]
                     }
@@ -9137,6 +9348,7 @@ mod tests {
                                             start: 4,
                                             end: 7,
                                         }),
+                                        Default::default(),
                                         AbiTags::default()))),
                         ]
                     }
@@ -9192,6 +9404,7 @@ mod tests {
                                             start: 1,
                                             end: 4,
                                         }),
+                                        Default::default(),
                                         AbiTags::default())))
                         ]
                     }
@@ -9206,7 +9419,9 @@ mod tests {
                                             start: 1,
                                             end: 4,
                                         }),
-                                    AbiTags::default()))),
+                                        Default::default(),
+                                        AbiTags::default()
+                                    ))),
                             Substitutable::Prefix(
                                 Prefix::Nested(
                                     PrefixHandle::BackReference(1),
@@ -9215,7 +9430,9 @@ mod tests {
                                             start: 5,
                                             end: 8,
                                         }),
-                                    AbiTags::default()))),
+                                        Default::default(),
+                                        AbiTags::default()
+                                    ))),
                         ]
                     }
                     b"3fooIJEE..." => {
@@ -9229,12 +9446,14 @@ mod tests {
                                             start: 1,
                                             end: 4,
                                         }),
+                                        Default::default(),
                                         AbiTags::default()))),
                             Substitutable::Prefix(
                                 Prefix::Template(PrefixHandle::BackReference(1),
-                                                 TemplateArgs(vec![
-                                                     TemplateArg::ArgPack(vec![]),
-                                                 ])))
+                                                 TemplateArgs {
+                                                     args: vec![TemplateArg::ArgPack(vec![])],
+                                                     requires_clause: ConstraintExpression(None),
+                                                 })),
                         ]
                     }
                     b"T_..." => {
@@ -9264,6 +9483,7 @@ mod tests {
                                             start: 1,
                                             end: 4,
                                         }),
+                                        Default::default(),
                                         AbiTags::default()))),
                             Substitutable::Prefix(
                                 Prefix::DataMember(
@@ -9292,7 +9512,9 @@ mod tests {
                                             start: 1,
                                             end: 4,
                                         }),
-                                    AbiTags::default()))),
+                                        Default::default(),
+                                        AbiTags::default()
+                                    ))),
                         ]
                     }
                 }
@@ -9376,9 +9598,10 @@ mod tests {
                             Substitutable::Type(
                                 Type::TemplateTemplate(
                                     TemplateTemplateParamHandle::BackReference(1),
-                                    TemplateArgs(vec![
-                                        TemplateArg::Type(TypeHandle::BackReference(0))
-                                    ]))),
+                                    TemplateArgs {
+                                        args: vec![TemplateArg::Type(TypeHandle::BackReference(0))],
+                                        requires_clause: ConstraintExpression(None),
+                                    })),
                         ]
                     }
                     b"DTtrE..." => {
@@ -9459,9 +9682,10 @@ mod tests {
                                         start: 2,
                                         end: 5,
                                     }),
-                                    Some(TemplateArgs(vec![
-                                        TemplateArg::Type(TypeHandle::BackReference(0))
-                                    ])),
+                                    Some(TemplateArgs {
+                                        args: vec![TemplateArg::Type(TypeHandle::BackReference(0))],
+                                        requires_clause: ConstraintExpression(None),
+                                    }),
                                     TypeHandle::BackReference(0)))
                         ]
                     }
@@ -9487,6 +9711,7 @@ mod tests {
                                                         start: 1,
                                                         end: 4,
                                                     }),
+                                                    Default::default(),
                                                     AbiTags::default()))))))
                         ]
                     }
@@ -9696,6 +9921,7 @@ mod tests {
                                         start: 1,
                                         end: 4,
                                     }),
+                                    Default::default(),
                                     AbiTags::default())))),
                     b"..."
                 }
@@ -9708,6 +9934,7 @@ mod tests {
                                         start: 3,
                                         end: 6,
                                     }),
+                                    Default::default(),
                                     AbiTags::default())))),
                     b"..."
                 }
@@ -9720,6 +9947,7 @@ mod tests {
                                         start: 3,
                                         end: 6,
                                     }),
+                                    Default::default(),
                                     AbiTags::default())))),
                     b"..."
                 }
@@ -9732,7 +9960,9 @@ mod tests {
                                         start: 3,
                                         end: 6,
                                     }),
-                                AbiTags::default())))),
+                                    Default::default(),
+                                    AbiTags::default()
+                                )))),
                     b"..."
                 }
             }
@@ -9898,17 +10128,45 @@ mod tests {
             ] => {
                 Ok => {
                     b"IS_E..." => {
-                        TemplateArgs(vec![TemplateArg::Type(TypeHandle::BackReference(0))]),
+                        TemplateArgs {
+                            args: vec![TemplateArg::Type(TypeHandle::BackReference(0))],
+                            requires_clause: ConstraintExpression(None),
+                        },
                         b"...",
                         []
                     }
                     b"IS_S_S_S_E..." => {
-                        TemplateArgs(vec![
-                            TemplateArg::Type(TypeHandle::BackReference(0)),
-                            TemplateArg::Type(TypeHandle::BackReference(0)),
-                            TemplateArg::Type(TypeHandle::BackReference(0)),
-                            TemplateArg::Type(TypeHandle::BackReference(0)),
-                        ]),
+                        TemplateArgs {
+                            args: vec![
+                                TemplateArg::Type(TypeHandle::BackReference(0)),
+                                TemplateArg::Type(TypeHandle::BackReference(0)),
+                                TemplateArg::Type(TypeHandle::BackReference(0)),
+                                TemplateArg::Type(TypeHandle::BackReference(0)),
+                            ],
+                            requires_clause: ConstraintExpression(None),
+                        },
+                        b"...",
+                        []
+                    }
+                    b"IS_QeqstS_Li1EE..." => {
+                        TemplateArgs {
+                            args: vec![TemplateArg::Type(TypeHandle::BackReference(0))],
+                            requires_clause: ConstraintExpression(Some(Box::new(
+                                Expression::Binary(
+                                    OperatorName::Simple(SimpleOperatorName::Eq),
+                                    Box::new(Expression::SizeofType(TypeHandle::BackReference(0))),
+                                    Box::new(Expression::Primary(
+                                        ExprPrimary::Literal(
+                                            TypeHandle::Builtin(
+                                                BuiltinType::Standard(
+                                                    StandardBuiltinType::Int,
+                                                ),
+                                            ), 12, 13,
+                                        ),
+                                    )),
+                                ),
+                            ))),
+                        },
                         b"...",
                         []
                     }
@@ -9975,8 +10233,8 @@ mod tests {
                                                 end: 7
                                             }),
                                             Some(
-                                                TemplateArgs(
-                                                    vec![
+                                                TemplateArgs {
+                                                    args: vec![
                                                         TemplateArg::Type(
                                                             TypeHandle::Builtin(
                                                                 BuiltinType::Standard(
@@ -9984,8 +10242,9 @@ mod tests {
                                                                 )
                                                             )
                                                         )
-                                                    ]
-                                                )
+                                                    ],
+                                                    requires_clause: ConstraintExpression(None),
+                                                }
                                             )
                                         )
                                     )
@@ -10017,12 +10276,62 @@ mod tests {
                         b"...",
                         []
                     }
+                    b"TyS_..." => {
+                        TemplateArg::ParamDecl(
+                            TemplateParamDecl::Type,
+                            Box::new(TemplateArg::Type(TypeHandle::BackReference(0)))
+                        ),
+                        b"...",
+                        []
+                    }
+                    b"TtTyQtrES_..." => {
+                        TemplateArg::ParamDecl(
+                            TemplateParamDecl::Template(
+                                vec![TemplateParamDecl::Type],
+                                ConstraintExpression(Some(Box::new(Expression::Rethrow)))
+                            ),
+                            Box::new(TemplateArg::Type(TypeHandle::BackReference(0)))
+                        ),
+                        b"...",
+                        []
+                    }
+                    b"TpTyJE..." => {
+                        TemplateArg::ParamDecl(
+                            TemplateParamDecl::ParameterPack(Box::new(TemplateParamDecl::Type)),
+                            Box::new(TemplateArg::ArgPack(vec![]))
+                        ),
+                        b"...",
+                        []
+                    }
+                    b"TnS_S_..." => {
+                        TemplateArg::ParamDecl(
+                            TemplateParamDecl::NonType(TypeHandle::BackReference(0)),
+                            Box::new(TemplateArg::Type(TypeHandle::BackReference(0)))
+                        ),
+                        b"...",
+                        []
+                    }
+                    b"TpTnS_S_..." => {
+                        TemplateArg::ParamDecl(
+                            TemplateParamDecl::ParameterPack(Box::new(
+                                TemplateParamDecl::NonType(TypeHandle::BackReference(0))
+                            )),
+                            Box::new(TemplateArg::Type(TypeHandle::BackReference(0)))
+                        ),
+                        b"...",
+                        []
+                    }
                 }
                 Err => {
                     b"..." => Error::UnexpectedText,
                     b"X..." => Error::UnexpectedText,
                     b"J..." => Error::UnexpectedText,
                     b"JS_..." => Error::UnexpectedText,
+                    // Declarations without their required type/name/argument.
+                    b"Ty" => Error::UnexpectedEnd,
+                    b"Tk" => Error::UnexpectedEnd,
+                    b"Tt" => Error::UnexpectedEnd,
+                    b"Tp" => Error::UnexpectedEnd,
                     b"JS_" => Error::UnexpectedEnd,
                     b"X" => Error::UnexpectedEnd,
                     b"J" => Error::UnexpectedEnd,
@@ -10463,7 +10772,9 @@ mod tests {
                                                     start: 5,
                                                     end: 8,
                                                 }),
-                                            AbiTags::default()))))),
+                                            Default::default(),
+                                            AbiTags::default()
+                                        ))))),
                         b"...",
                         []
                     }
@@ -10479,7 +10790,9 @@ mod tests {
                                                     start: 5,
                                                     end: 8,
                                                 }),
-                                            AbiTags::default()))))),
+                                            Default::default(),
+                                            AbiTags::default()
+                                        ))))),
                         b"...",
                         []
                     }
@@ -10489,9 +10802,12 @@ mod tests {
                             MemberName(
                                 Name::UnscopedTemplate(
                                     UnscopedTemplateNameHandle::NonSubstitution(NonSubstitution(0)),
-                                    TemplateArgs(vec![
-                                        TemplateArg::Type(
-                                            TypeHandle::BackReference(1))])))),
+                                    TemplateArgs {
+                                        args: vec![
+                                            TemplateArg::Type(
+                                                TypeHandle::BackReference(1))],
+                                        requires_clause: ConstraintExpression(None),
+                                    }))),
                         b"...",
                         [
                             Substitutable::Type(
@@ -10505,7 +10821,9 @@ mod tests {
                                                             start: 9,
                                                             end: 12
                                                         }),
-                                                    AbiTags::default()))))))
+                                                    Default::default(),
+                                                    AbiTags::default()
+                                                ))))))
                         ]
                     }
                     //               ::= ds <expression> <expression>                 # expr.*expr
@@ -10606,7 +10924,10 @@ mod tests {
                                                         start: 4,
                                                         end: 7,
                                                     }),
-                                                AbiTags::default())))), vec![]))),
+                                                    Default::default(),
+                                                    AbiTags::default()
+                                                )))),
+                                    vec![]))),
                         b"...",
                         []
                     }
@@ -10629,7 +10950,9 @@ mod tests {
                                                     start: 10,
                                                     end: 14,
                                                 }),
-                                                AbiTags::default()))
+                                                Default::default(),
+                                                AbiTags::default()
+                                            ))
                                      )
                                 )
                             )),
@@ -10795,9 +11118,10 @@ mod tests {
                         b"...",
                         [
                             Substitutable::UnresolvedType(
-                                UnresolvedType::Template(TemplateParam(0, None), Some(TemplateArgs(vec![
-                                    TemplateArg::Type(TypeHandle::BackReference(0))
-                                ])))),
+                                UnresolvedType::Template(TemplateParam(0, None), Some(TemplateArgs {
+                                    args: vec![TemplateArg::Type(TypeHandle::BackReference(0))],
+                                    requires_clause: ConstraintExpression(None),
+                                }))),
                         ]
                     }
                     b"DTtrE..." => {
@@ -10837,9 +11161,10 @@ mod tests {
                         UnresolvedQualifierLevel(SimpleId(SourceName(Identifier {
                             start: 1,
                             end: 4,
-                        }), Some(TemplateArgs(vec![
-                            TemplateArg::Type(TypeHandle::BackReference(0))
-                        ])))),
+                        }), Some(TemplateArgs {
+                            args: vec![TemplateArg::Type(TypeHandle::BackReference(0))],
+                            requires_clause: ConstraintExpression(None),
+                        }))),
                         b"...",
                         []
                     }
@@ -10871,9 +11196,10 @@ mod tests {
                         SimpleId(SourceName(Identifier {
                             start: 1,
                             end: 4,
-                        }), Some(TemplateArgs(vec![
-                            TemplateArg::Type(TypeHandle::BackReference(0))
-                        ]))),
+                        }), Some(TemplateArgs {
+                            args: vec![TemplateArg::Type(TypeHandle::BackReference(0))],
+                            requires_clause: ConstraintExpression(None),
+                        })),
                         b"...",
                         []
                     }
@@ -10908,9 +11234,10 @@ mod tests {
                     }
                     b"onnwIS_E..." => {
                         BaseUnresolvedName::Operator(OperatorName::Simple(SimpleOperatorName::New),
-                                                     Some(TemplateArgs(vec![
-                                                         TemplateArg::Type(TypeHandle::BackReference(0))
-                                                     ]))),
+                                                     Some(TemplateArgs {
+                                                         args: vec![TemplateArg::Type(TypeHandle::BackReference(0))],
+                                                         requires_clause: ConstraintExpression(None),
+                                                     })),
                         b"...",
                         []
                     }
@@ -10992,7 +11319,10 @@ mod tests {
                                                     start: 4,
                                                     end: 7,
                                                 }),
-                                                AbiTags::default())))), vec![])),
+                                                Default::default(),
+                                                AbiTags::default()
+                                            )))),
+                                vec![])),
                         b"...",
                         []
                     }
@@ -11052,6 +11382,7 @@ mod tests {
                                             start: 2,
                                             end: 5,
                                         }),
+                                        Default::default(),
                                         AbiTags::default()))))),
                         Some(Box::new(Name::Unscoped(
                             UnscopedName::Unqualified(
@@ -11060,6 +11391,7 @@ mod tests {
                                         start: 7,
                                         end: 10,
                                     }),
+                                    Default::default(),
                                     AbiTags::default()))))),
                         Some(Discriminator(0))),
                     b"..."
@@ -11074,6 +11406,7 @@ mod tests {
                                             start: 2,
                                             end: 5,
                                         }),
+                                        Default::default(),
                                         AbiTags::default()))))),
                         Some(Box::new(Name::Unscoped(
                             UnscopedName::Unqualified(
@@ -11082,6 +11415,7 @@ mod tests {
                                         start: 7,
                                         end: 10,
                                     }),
+                                    Default::default(),
                                     AbiTags::default()))))),
                         None),
                     b"..."
@@ -11096,7 +11430,9 @@ mod tests {
                                             start: 2,
                                             end: 5,
                                         }),
-                                    AbiTags::default()))))),
+                                        Default::default(),
+                                        AbiTags::default()
+                                    ))))),
                         None,
                         Some(Discriminator(0))),
                     b"..."
@@ -11111,7 +11447,9 @@ mod tests {
                                             start: 2,
                                             end: 5,
                                         }),
-                                    AbiTags::default()))))),
+                                        Default::default(),
+                                        AbiTags::default()
+                                    ))))),
                         None,
                         None),
                     b"..."
@@ -11126,7 +11464,9 @@ mod tests {
                                             start: 2,
                                             end: 5,
                                         }),
-                                    AbiTags::default()))))),
+                                        Default::default(),
+                                        AbiTags::default()
+                                    ))))),
                         Some(1),
                         Box::new(Name::Unscoped(
                             UnscopedName::Unqualified(
@@ -11135,7 +11475,9 @@ mod tests {
                                         start: 10,
                                         end: 13,
                                     }),
-                                    AbiTags::default()))))),
+                                    Default::default(),
+                                    AbiTags::default()
+                                ))))),
                     b"..."
                 }
                 b"Z3abcEd_3abc..." => {
@@ -11148,7 +11490,9 @@ mod tests {
                                             start: 2,
                                             end: 5,
                                         }),
-                                        AbiTags::default()))))),
+                                        Default::default(),
+                                        AbiTags::default()
+                                    ))))),
                         None,
                         Box::new(Name::Unscoped(
                             UnscopedName::Unqualified(
@@ -11156,7 +11500,10 @@ mod tests {
                                     SourceName(Identifier {
                                         start: 9,
                                         end: 12,
-                                    }), AbiTags::default()))))),
+                                    }),
+                                    Default::default(),
+                                    AbiTags::default()
+                                ))))),
                     b"..."
                 }
             }
@@ -11328,7 +11675,10 @@ mod tests {
                                         SourceName(Identifier {
                                             start: 9,
                                             end: 12,
-                                        }), AbiTags::default())))))),
+                                        }),
+                                        Default::default(),
+                                        AbiTags::default()
+                                    )))))),
                     b"..."
                 }
                 b"Tcv42_36_v42_36_3abc..." => {
@@ -11342,7 +11692,10 @@ mod tests {
                                         SourceName(Identifier {
                                             start: 17,
                                             end: 20,
-                                        }), AbiTags::default())))))),
+                                        }),
+                                        Default::default(),
+                                        AbiTags::default()
+                                    )))))),
                     b"..."
                 }
                 b"GV3abc..." => {
@@ -11353,7 +11706,10 @@ mod tests {
                                     SourceName(Identifier {
                                         start: 3,
                                         end: 6,
-                                    }), AbiTags::default())))),
+                                    }),
+                                    Default::default(),
+                                    AbiTags::default()
+                                )))),
                     b"..."
                 }
                 b"GR3abc_..." => {
@@ -11365,7 +11721,9 @@ mod tests {
                                         start: 3,
                                         end: 6,
                                     }),
-                                    AbiTags::default()))),
+                                    Default::default(),
+                                    AbiTags::default()
+                                ))),
                         0),
                     b"..."
                 }
@@ -11378,7 +11736,9 @@ mod tests {
                                         start: 3,
                                         end: 6,
                                     }),
-                                    AbiTags::default()))),
+                                    Default::default(),
+                                    AbiTags::default()
+                                ))),
                         1),
                     b"..."
                 }
@@ -11408,7 +11768,9 @@ mod tests {
                             UnscopedName::Unqualified(
                                 UnqualifiedName::Source(
                                     SourceName(Identifier { start: 3, end: 7 }),
-                                AbiTags::default())))),
+                                    Default::default(),
+                                    AbiTags::default()
+                                )))),
                     b"..."
                 }
                 b"TW4name..." => {
@@ -11417,7 +11779,9 @@ mod tests {
                             UnscopedName::Unqualified(
                                 UnqualifiedName::Source(
                                     SourceName(Identifier { start: 3, end: 7 }),
-                                AbiTags::default())))),
+                                    Default::default(),
+                                    AbiTags::default()
+                                )))),
                     b"..."
                 }
             }
@@ -11646,7 +12010,7 @@ mod tests {
                     BuiltinType::Parametric(ParametricBuiltinType::SignedBitInt(8)),
                     b"..."
                 }
-                b"DUsZT_" => {
+                b"DUsZT__" => {
                     BuiltinType::Parametric(ParametricBuiltinType::UnsignedBitIntExpression(Box::new(Expression::SizeofTemplatePack(TemplateParam(0, None))))),
                     b""
                 }
@@ -11697,23 +12061,31 @@ mod tests {
         assert_parse!(UnscopedName {
             Ok => {
                 b"St5hello..." => {
-                    UnscopedName::Std(UnqualifiedName::Source(SourceName(Identifier {
-                        start: 3,
-                        end: 8,
-                    }),
-                    AbiTags::default())),
+                    UnscopedName::Std(UnqualifiedName::Source(
+                        SourceName(Identifier {
+                            start: 3,
+                            end: 8,
+                        }),
+                        Default::default(),
+                        AbiTags::default()
+                    )),
                     b"..."
                 }
                 b"5hello..." => {
-                    UnscopedName::Unqualified(UnqualifiedName::Source(SourceName(Identifier {
-                        start: 1,
-                        end: 6,
-                    }), AbiTags::default())),
+                    UnscopedName::Unqualified(UnqualifiedName::Source(
+                        SourceName(Identifier {
+                            start: 1,
+                            end: 6,
+                        }),
+                        Default::default(),
+                        AbiTags::default()
+                    )),
                     b"..."
                 }
             }
             Err => {
                 b"St..." => Error::UnexpectedText,
+                b"F3Foo..." => Error::UnexpectedText,
                 b"..." => Error::UnexpectedText,
                 b"" => Error::UnexpectedEnd,
             }
@@ -11724,7 +12096,7 @@ mod tests {
     fn parse_unqualified_name() {
         // <unqualified-name> ::= [on] <operator-name> [<abi-tags>]
         //                    ::= <ctor-dtor-name> [<abi-tags>]
-        //                    ::= <source-name> [<abi-tags>]
+        //                    ::= F? <source-name> [<abi-tags>]
         //                    ::= <local-source-name> [<abi-tags>]
         //                    ::= <unnamed-type-name> [<abi-tags>]
         //                    ::= <closure-type-name> [<abi-tags>]
@@ -11743,10 +12115,14 @@ mod tests {
                     b".."
                 }
                 b"10abcdefghij..." => {
-                    UnqualifiedName::Source(SourceName(Identifier {
-                        start: 2,
-                        end: 12,
-                    }), AbiTags::default()),
+                    UnqualifiedName::Source(
+                        SourceName(Identifier {
+                            start: 2,
+                            end: 12,
+                        }),
+                        Default::default(),
+                        AbiTags::default()
+                    ),
                     b"..."
                 }
                 b"UllE_..." => {
@@ -11821,6 +12197,7 @@ mod tests {
                             start: 2,
                             end: 12,
                         }),
+                        Default::default(),
                         AbiTags(vec![
                             AbiTag(
                                 SourceName(
@@ -12267,6 +12644,7 @@ mod tests {
                                                                 end: 10,
                                                             }
                                                         ),
+                                                        Default::default(),
                                                         AbiTags::default()
                                                     )
                                                 )

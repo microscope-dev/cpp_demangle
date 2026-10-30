@@ -682,6 +682,41 @@ demangles!(
     "decltype ((((declval<nlohmann::basic_json<std::map, std::vector, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, bool, long, unsigned long, double, std::allocator, nlohmann::adl_serializer, std::vector<unsigned char, std::allocator<unsigned char> > > const&>)()).(get_impl<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >))((nlohmann::detail::priority_tag<(unsigned int)4>)({}))) nlohmann::basic_json<std::map, std::vector, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, bool, long, unsigned long, double, std::allocator, nlohmann::adl_serializer, std::vector<unsigned char, std::allocator<unsigned char> > >::get<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >() const"
 );
 
+// _BitInt(N) is substitutable, but _FloatN is not.
+demangles!(_Z1fDB8_S_, "f(_BitInt(8), _BitInt(8))");
+demangles!(_Z1fDU8_S_, "f(unsigned _BitInt(8), unsigned _BitInt(8))");
+demangles!(_Z1fILi8EEvDBT__S0_, "void f<8>(_BitInt(8), _BitInt(8))");
+demangles!(_Z1fDF32_2xxS_, "f(_Float32, xx, xx)");
+
+// Vendor extended builtin type is substitutable.
+demangles!(_Z1fu2xxS_, "f(xx, xx)");
+
+// Non-type template parameter mangling is supported.
+demangles!(
+    _ZNSt3__112__hash_tableINS_17__hash_value_typeINS_12basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEEmEENS_22__unordered_map_hasherIS7_S8_N2DB32StringHashForHeterogeneousLookupENS_8equal_toIvEELb1EEENS_21__unordered_map_equalIS7_S8_SD_SB_Lb1EEENS5_IS8_EEE16__emplace_uniqueB8ne190107IRS7_RmTnNS_9enable_ifIXsr21__can_extract_map_keyIT_S7_NS_4pairIKS7_mEEEE5valueEiE4typeELi0EEENSO_INS_15__hash_iteratorIPNS_11__hash_nodeIS8_PvEEEEbEEOSN_OT0_,
+    "std::__1::pair<std::__1::__hash_iterator<std::__1::__hash_node<std::__1::__hash_value_type<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> >, unsigned long>, void*>*>, bool> std::__1::__hash_table<std::__1::__hash_value_type<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> >, unsigned long>, std::__1::__unordered_map_hasher<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> >, std::__1::__hash_value_type<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> >, unsigned long>, DB::StringHashForHeterogeneousLookup, std::__1::equal_to<void>, true>, std::__1::__unordered_map_equal<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> >, std::__1::__hash_value_type<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> >, unsigned long>, std::__1::equal_to<void>, DB::StringHashForHeterogeneousLookup, true>, std::__1::allocator<std::__1::__hash_value_type<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> >, unsigned long> > >::__emplace_unique[abi:ne190107]<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> >&, unsigned long&, 0>(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> >&, unsigned long&)"
+);
+
+demangles!(
+    _ZNSt3__118__apply_tuple_implB8ne190107IRZN2DB13SystemLogBaseINS1_21BlobStorageLogElementEE7startupEvEUlvE_RNS_5tupleIJEEETpTnmJEEEDcOT_OT0_NS_15__tuple_indicesIJXspT1_EEEE,
+    "decltype(auto) std::__1::__apply_tuple_impl[abi:ne190107]<DB::SystemLogBase<DB::BlobStorageLogElement>::startup()::{lambda()#1}&, std::__1::tuple<>&>(DB::SystemLogBase<DB::BlobStorageLogElement>::startup()::{lambda()#1}&, std::__1::tuple<>&, std::__1::__tuple_indices<()...>)"
+);
+
+demangles!(
+    _ZN2DB5Field6createIcEEvPKS1_m,
+    "void DB::Field::create<char>(DB::Field::create const*, unsigned long)"
+);
+
+demangles!(
+    _ZNK5coro15emptyawEv,
+    "coro1::empty::operator co_await() const"
+);
+demangles!(_ZNK3FoossERKS_, "Foo::operator<=>(Foo const&) const");
+demangles!(
+    _ZN5test21AIiEF1fEzQ4TrueIT_E,
+    "test2::A<int>::friend f(...)"
+);
+
 // This symbol previously ran into some mutual recursion and unbounded growth of the substitution table.
 // See <https://github.com/gimli-rs/cpp_demangle/issues/277> and <https://github.com/getsentry/symbolic/issues/477>
 #[test]
