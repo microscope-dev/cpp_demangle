@@ -36,6 +36,21 @@ The fuzz target compares owned and borrowed parsing and rendering, including
 rendering options and a low recursion limit. Rendering errors are valid
 outcomes even when parsing succeeds.
 
+## Upstream and advisories
+
+The fork follows [gimli-rs/cpp_demangle](https://github.com/gimli-rs/cpp_demangle)
+`master` at `076632f924b1c87c7de8ef6a5c604edb97964978`, 11 commits after the
+0.5.1 release, and keeps upstream's version, 0.5.1. RustSec matches advisories
+by crate name and version, so cargo-deny and cargo-audit in microscope check
+this fork as if it were 0.5.1 from crates.io. They know nothing of the code
+the fork adds, and judge upstream's code by the version alone, not by which
+upstream commits the fork has merged. When merging upstream, update the commit
+above and read
+[cpp_demangle's advisories](https://rustsec.org/packages/cpp_demangle.html)
+for fixes the fork lacks. There were none as of November 2026.
+
+## Updating microscope
+
 microscope pins a commit from this fork as a Git dependency in its `Cargo.toml`.
 After pushing a new fork commit, update that `rev` and refresh microscope's
 root and fuzz lockfiles. Switch back to crates.io once an upstream release
